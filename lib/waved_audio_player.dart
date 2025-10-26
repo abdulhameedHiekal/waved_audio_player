@@ -66,7 +66,9 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
   
   @override
   void dispose() {
+    if(!mounted){
     _audioPlayer?.dispose();
+    }  
     super.dispose();
   }
 
