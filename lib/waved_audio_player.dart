@@ -63,6 +63,13 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
     _setupAudioPlayer();
   }
 
+  
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadWaveform() async {
     try {
       if (_audioBytes == null) {
