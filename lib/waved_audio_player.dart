@@ -2,6 +2,7 @@
 
 library waved_audio_player;
 
+import 'dart:async'; // <-- for StreamSubscription
 import 'dart:io';
 import 'dart:math';
 
@@ -27,21 +28,23 @@ class WavedAudioPlayer extends StatefulWidget {
   bool showTiming;
   TextStyle? timingStyle;
   void Function(WavedAudioPlayerError)? onError;
-  WavedAudioPlayer(
-      {super.key,
-      required this.source,
-      this.playedColor = Colors.blue,
-      this.unplayedColor = Colors.grey,
-      this.iconColor = Colors.blue,
-      this.iconBackgoundColor = Colors.white,
-      this.barWidth = 2,
-      this.spacing = 4,
-      this.waveWidth = 200,
-      this.buttonSize = 40,
-      this.showTiming = true,
-      this.timingStyle,
-      this.onError,
-      this.waveHeight = 35});
+
+  WavedAudioPlayer({
+    super.key,
+    required this.source,
+    this.playedColor = Colors.blue,
+    this.unplayedColor = Colors.grey,
+    this.iconColor = Colors.blue,
+    this.iconBackgoundColor = Colors.white,
+    this.barWidth = 2,
+    this.spacing = 4,
+    this.waveWidth = 200,
+    this.buttonSize = 40,
+    this.showTiming = true,
+    this.timingStyle,
+    this.onError,
+    this.waveHeight = 35,
+  });
 
   @override
   _WavedAudioPlayerState createState() => _WavedAudioPlayerState();
@@ -49,12 +52,23 @@ class WavedAudioPlayer extends StatefulWidget {
 
 class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
   final AudioPlayer _audioPlayer = AudioPlayer();
+
+  // --- State
   List<double> waveformData = [];
   Duration audioDuration = Duration.zero;
   Duration currentPosition = Duration.zero;
   bool isPlaying = false;
   bool isPausing = true;
   Uint8List? _audioBytes;
+
+  // --- Subscriptions {{اشتراكات}}
+  late final StreamSubscription<PlayerState> _stateSub;
+  late final StreamSubscription<void> _completeSub;
+  late final StreamSubscription<Duration> _durSub;
+  late final StreamSubscription<Duration> _posSub;
+
+  // Extra guard {{حارس إضافي}}
+  bool _disposed = false;
 
   @override
   void initState() {
@@ -63,12 +77,32 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
     _setupAudioPlayer();
   }
 
-  
+  // safe setState {{استدعاء آمن لـ setState}}
+  void _safeSetState(VoidCallback fn) {
+    if (!mounted || _disposed) return;
+    setState(fn);
+  }
+
   @override
   void dispose() {
-    if(!mounted){
-    _audioPlayer?.stop();
-    }  
+    _disposed = true;
+
+    // Cancel streams first {{إلغاء المستمعين أولاً}}
+    try {
+      _stateSub.cancel();
+      _completeSub.cancel();
+      _durSub.cancel();
+      _posSub.cancel();
+    } catch (_) {
+      // ignore
+    }
+
+    // Stop and dispose player {{إيقاف وتحرير المشغّل}}
+    try {
+      _audioPlayer.stop();
+    } catch (_) {}
+    _audioPlayer.dispose();
+
     super.dispose();
   }
 
@@ -76,21 +110,26 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
     try {
       if (_audioBytes == null) {
         if (widget.source is AssetSource) {
-          _audioBytes = await _loadAssetAudioWaveform(
-              (widget.source as AssetSource).path);
+          _audioBytes =
+          await _loadAssetAudioWaveform((widget.source as AssetSource).path);
         } else if (widget.source is UrlSource) {
           _audioBytes =
-              await _loadRemoteAudioWaveform((widget.source as UrlSource).url);
+          await _loadRemoteAudioWaveform((widget.source as UrlSource).url);
         } else if (widget.source is DeviceFileSource) {
           _audioBytes = await _loadDeviceFileAudioWaveform(
               (widget.source as DeviceFileSource).path);
         } else if (widget.source is BytesSource) {
           _audioBytes = (widget.source as BytesSource).bytes;
         }
+
+        if (_audioBytes == null) return;
+
         waveformData = _extractWaveformData(_audioBytes!);
-        setState(() {});
+        _safeSetState(() {}); // rebuild once data ready
       }
-      _audioPlayer.setSource(BytesSource(_audioBytes!, mimeType: widget.source.mimeType));
+
+      await _audioPlayer
+          .setSource(BytesSource(_audioBytes!, mimeType: widget.source.mimeType));
     } catch (e) {
       _callOnError(WavedAudioPlayerError("Error loading audio: $e"));
     }
@@ -98,77 +137,79 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
 
   Future<Uint8List?> _loadDeviceFileAudioWaveform(String filePath) async {
     try {
-      final File file = File(filePath);
-      final Uint8List audioBytes = await file.readAsBytes();
-      return audioBytes;
+      final file = File(filePath);
+      return await file.readAsBytes();
     } catch (e) {
       _callOnError(WavedAudioPlayerError("Error loading file audio: $e"));
+      return null;
     }
-    return null;
   }
 
   Future<Uint8List?> _loadAssetAudioWaveform(String path) async {
     try {
-      final ByteData bytes = await rootBundle.load(path);
+      final bytes = await rootBundle.load(path);
       return bytes.buffer.asUint8List();
     } catch (e) {
       _callOnError(WavedAudioPlayerError("Error loading asset audio: $e"));
+      return null;
     }
-    return null;
   }
 
   Future<Uint8List?> _loadRemoteAudioWaveform(String url) async {
+    HttpClient? httpClient;
     try {
-      final HttpClient httpClient = HttpClient();
-      final HttpClientRequest request = await httpClient.getUrl(Uri.parse(url));
-      final HttpClientResponse response = await request.close();
+      httpClient = HttpClient();
+      final request = await httpClient.getUrl(Uri.parse(url));
+      final response = await request.close();
 
       if (response.statusCode == 200) {
         return await consolidateHttpClientResponseBytes(response);
       } else {
         _callOnError(WavedAudioPlayerError(
             "Failed to load audio: ${response.statusCode}"));
+        return null;
       }
-
-      httpClient.close();
     } catch (e) {
       _callOnError(WavedAudioPlayerError("Error loading audio: $e"));
+      return null;
+    } finally {
+      try {
+        httpClient?.close(force: true);
+      } catch (_) {}
     }
-    return null;
   }
 
-  _callOnError(WavedAudioPlayerError error) {
+  void _callOnError(WavedAudioPlayerError error) {
     if (widget.onError == null) return;
+    // print error nicely
+    // ignore: avoid_print
     print('\x1B[31m ${error.message}\x1B[0m');
     widget.onError!(error);
   }
 
   void _setupAudioPlayer() {
-    _audioPlayer.onPlayerStateChanged.listen((PlayerState state) {
-      if (state == PlayerState.playing) {
-        setState(() {
-          isPlaying = true;
+    _stateSub =
+        _audioPlayer.onPlayerStateChanged.listen((PlayerState state) {
+          _safeSetState(() {
+            isPlaying = (state == PlayerState.playing);
+          });
         });
-      } else {
-        setState(() {
-          isPlaying = false;
-        });
-      }
-    });
-    _audioPlayer.onPlayerComplete.listen((event) {
+
+    _completeSub = _audioPlayer.onPlayerComplete.listen((_) {
+      // keep UI stable; if you need UI change, guard via _safeSetState
       isPausing = false;
       _audioPlayer.release();
     });
 
-    _audioPlayer.onDurationChanged.listen((Duration duration) {
-      setState(() {
+    _durSub = _audioPlayer.onDurationChanged.listen((Duration duration) {
+      _safeSetState(() {
         audioDuration = duration;
         isPausing = true;
       });
     });
 
-    _audioPlayer.onPositionChanged.listen((Duration position) {
-      setState(() {
+    _posSub = _audioPlayer.onPositionChanged.listen((Duration position) {
+      _safeSetState(() {
         currentPosition = position;
         isPausing = true;
       });
@@ -180,19 +221,19 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
     final hours = duration.inHours;
     final minutes = twoDigits(duration.inMinutes.remainder(60));
     final seconds = twoDigits(duration.inSeconds.remainder(60));
-
     if (hours > 0) {
-      return "${twoDigits(hours)}:$minutes:$seconds"; // Format as HH:MM:SS
+      return "${twoDigits(hours)}:$minutes:$seconds"; // HH:MM:SS
     } else {
-      return "$minutes:$seconds"; // Format as MM:SS
+      return "$minutes:$seconds"; // MM:SS
     }
   }
 
   List<double> _extractWaveformData(Uint8List audioBytes) {
-    List<double> waveData = [];
-    int step = (audioBytes.length /
-            (widget.waveWidth / (widget.barWidth + widget.spacing)))
-        .floor();
+    final List<double> waveData = [];
+    final step = (audioBytes.length /
+        (widget.waveWidth / (widget.barWidth + widget.spacing)))
+        .floor()
+        .clamp(1, audioBytes.length);
     for (int i = 0; i < audioBytes.length; i += step) {
       waveData.add(audioBytes[i] / 255);
     }
@@ -201,19 +242,22 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
   }
 
   void _onWaveformTap(double tapX, double width) {
-    double tapPercent = tapX / width;
-    Duration newPosition = audioDuration * tapPercent;
+    if (audioDuration == Duration.zero) return;
+    final tapPercent = (tapX / width).clamp(0.0, 1.0);
+    final newPosition = audioDuration * tapPercent;
     _audioPlayer.seek(newPosition);
   }
 
-  void _playAudio() async {
+  void _playAudio() {
     if (_audioBytes == null) return;
-    isPausing
-        ? _audioPlayer.resume()
-        : _audioPlayer.play(BytesSource(_audioBytes!,mimeType: widget.source.mimeType));
+    if (isPausing) {
+      _audioPlayer.resume();
+    } else {
+      _audioPlayer.play(BytesSource(_audioBytes!, mimeType: widget.source.mimeType));
+    }
   }
 
-  void _pauseAudio() async {
+  void _pauseAudio() {
     _audioPlayer.pause();
     isPausing = true;
   }
@@ -222,72 +266,68 @@ class _WavedAudioPlayerState extends State<WavedAudioPlayer> {
   Widget build(BuildContext context) {
     return (waveformData.isNotEmpty)
         ? Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              GestureDetector(
-                onTap: () {
-                  isPlaying ? _pauseAudio() : _playAudio();
-                  setState(() {
-                    isPlaying = !isPlaying;
-                  });
-                },
-                child: Container(
-                  height: widget.buttonSize,
-                  width: widget.buttonSize,
-                  decoration: BoxDecoration(
-                    color: widget.iconBackgoundColor,
-                    borderRadius: BorderRadius.circular(40),
-                  ),
-                  child: Icon(
-                    isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                    color: widget.iconColor,
-                    size: 4 * widget.buttonSize / 5,
-                  ),
-                ),
-              ),
-              const SizedBox(
-                width: 10,
-              ),
-              GestureDetector(
-                onTapDown: (TapDownDetails details) {
-                  // Call _onWaveformTap when the user taps on the waveform
-                  _onWaveformTap(details.localPosition.dx, widget.waveWidth);
-                },
-                child: CustomPaint(
-                  size: Size(widget.waveWidth, widget.waveHeight),
-                  painter: WaveformPainter(
-                      waveformData,
-                      currentPosition.inMilliseconds /
-                          (audioDuration.inMilliseconds == 0
-                              ? 1
-                              : audioDuration.inMilliseconds),
-                      playedColor: widget.playedColor,
-                      unplayedColor: widget.unplayedColor,
-                      barWidth: widget.barWidth), // Use your wave data
-                ),
-              ),
-              if (widget.showTiming)
-                const SizedBox(
-                  width: 10,
-                ),
-              if (widget.showTiming)
-                Center(
-                    child: Text(
-                  _formatDuration(currentPosition),
-                  style: widget.timingStyle,
-                ))
-            ],
-          )
-        : SizedBox(
-            width: widget.waveWidth + widget.buttonSize,
-            height: max(widget.waveHeight, widget.buttonSize),
-            child: Center(
-              child: LinearProgressIndicator(
-                color: widget.playedColor,
-                borderRadius: BorderRadius.circular(40),
-              ),
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        GestureDetector(
+          onTap: () {
+            isPlaying ? _pauseAudio() : _playAudio();
+            _safeSetState(() {
+              isPlaying = !isPlaying;
+            });
+          },
+          child: Container(
+            height: widget.buttonSize,
+            width: widget.buttonSize,
+            decoration: BoxDecoration(
+              color: widget.iconBackgoundColor,
+              borderRadius: BorderRadius.circular(40),
             ),
-          );
+            child: Icon(
+              isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+              color: widget.iconColor,
+              size: 4 * widget.buttonSize / 5,
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        GestureDetector(
+          onTapDown: (details) {
+            _onWaveformTap(details.localPosition.dx, widget.waveWidth);
+          },
+          child: CustomPaint(
+            size: Size(widget.waveWidth, widget.waveHeight),
+            painter: WaveformPainter(
+              waveformData,
+              audioDuration.inMilliseconds == 0
+                  ? 0
+                  : currentPosition.inMilliseconds /
+                  audioDuration.inMilliseconds,
+              playedColor: widget.playedColor,
+              unplayedColor: widget.unplayedColor,
+              barWidth: widget.barWidth,
+            ),
+          ),
+        ),
+        if (widget.showTiming) const SizedBox(width: 10),
+        if (widget.showTiming)
+          Center(
+            child: Text(
+              _formatDuration(currentPosition),
+              style: widget.timingStyle,
+            ),
+          ),
+      ],
+    )
+        : SizedBox(
+      width: widget.waveWidth + widget.buttonSize,
+      height: max(widget.waveHeight, widget.buttonSize),
+      child: Center(
+        child: LinearProgressIndicator(
+          color: widget.playedColor,
+          borderRadius: BorderRadius.circular(40),
+        ),
+      ),
+    );
   }
 }
